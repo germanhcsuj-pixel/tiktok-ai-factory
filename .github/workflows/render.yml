@@ -1,0 +1,76 @@
+name: Render TikTok MP4
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.html"
+      - "assets/**"
+      - "compositions/**"
+      - "hyperframes.json"
+      - "meta.json"
+      - "package.json"
+      - ".github/workflows/render.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      HYPERFRAMES_NO_UPDATE_CHECK: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install browser for HyperFrames
+        run: |
+          npx --yes hyperframes@0.8.116 browser ensure
+
+      - name: Lint HyperFrames project
+        run: |
+          npx --yes hyperframes@0.8.116 lint .
+
+      - name: Check HyperFrames project
+        run: |
+          npx --yes hyperframes@0.8.116 check .
+
+      - name: Render video
+        run: |
+          npx --yes hyperframes@0.8.116 render . \
+            --output video.mp4 \
+            --quality high
+
+      - name: Save MP4 as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-video
+          path: video.mp4
+
+      - name: Publish MP4 as GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="render-${GITHUB_RUN_ID}"
+
+          gh release create "$TAG" video.mp4 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Automatic HyperFrames render from commit $GITHUB_SHA"
