@@ -1,0 +1,94 @@
+name: Blender cloud render
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Render quality
+        type: choice
+        options: [test, final]
+        default: test
+      archive_release:
+        description: Archive validated MP4 in a PUBLIC release (explicit opt-in)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 21 * * *'
+  push:
+    branches: [main]
+    paths: ['blender/**', '.github/workflows/blender-render.yml']
+permissions:
+  contents: read
+concurrency:
+  group: blender-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  render:
+    # Scheduled final rendering is opt-in after the real test is reviewed.
+    if: github.event_name != 'schedule' || vars.BLENDER_DAILY_ENABLED == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      PROFILE: ${{ github.event_name == 'schedule' && 'final' || inputs.profile || 'test' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create diagnostics directory
+        run: mkdir -p render-output/logs
+      - name: Install system dependencies
+        run: |
+          set -o pipefail
+          sudo apt-get update 2>&1 | tee render-output/logs/apt-update.log
+          sudo apt-get install -y ffmpeg libx11-6 libxi6 libxrender1 libxxf86vm1 libxfixes3 libgl1 libegl1 libxkbcommon0 2>&1 | tee render-output/logs/apt-install.log
+      - name: Install verified Blender archive
+        run: |
+          set -o pipefail
+          bash blender/install.sh 2>&1 | tee render-output/logs/install.log
+      - name: Render Cycles CPU animation
+        run: |
+          set -o pipefail
+          blender --version | tee render-output/logs/version.log
+          SEED=$(date -u +%Y%m%d)
+          blender --background --factory-startup --threads 2 --python-exit-code 1 --python blender/scene.py -- --profile "$PROFILE" --engine CYCLES --seed "$SEED" 2>&1 | tee render-output/logs/blender.log
+      - name: Assemble H264 MP4
+        run: |
+          set -o pipefail
+          ffmpeg -y -framerate 30 -start_number 1 -i render-output/frames/frame_%04d.png -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart render-output/video.mp4 2>&1 | tee render-output/logs/ffmpeg.log
+      - name: Verify decoded MP4
+        run: |
+          set -o pipefail
+          python3 blender/verify.py render-output 2>&1 | tee render-output/logs/verify.log
+      - name: Fallback Workbench diagnostic on render failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          blender --background --factory-startup --python-exit-code 1 --python blender/scene.py -- --profile test --engine BLENDER_WORKBENCH --probe --output render-output/workbench 2>&1 | tee render-output/logs/workbench.log
+      - name: Save video, scene, partial frames and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-${{ github.run_id }}-${{ github.run_attempt }}
+          path: render-output/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Job summary
+        if: always()
+        run: |
+          echo "Profile: $PROFILE; commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if test -f render-output/verified.json; then cat render-output/verified.json >> "$GITHUB_STEP_SUMMARY"; fi
+  archive:
+    needs: render
+    if: github.event_name == 'workflow_dispatch' && inputs.archive_release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: blender-${{ github.run_id }}-${{ github.run_attempt }}
+          path: render-output
+      - name: Archive only validated output
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f render-output/verified.json
+          gh release create "blender-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" render-output/video.mp4 render-output/verified.json render-output/manifest.json --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Blender render $GITHUB_RUN_ID" --notes "Validated render. Explicit archive opt-in."
